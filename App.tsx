@@ -1,39 +1,113 @@
-
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import { GoogleGenAI, Chat } from "@google/genai";
 import { GraphVisualization } from './components/GraphVisualization';
-import { InputBar } from './components/InputBar';
-import { ResponsePanel } from './components/ResponsePanel';
-import { LoadingIndicator } from './components/LoadingIndicator';
-import { querySwarmConsciousness } from './services/geminiService';
+import { ChatPanel } from './components/ChatPanel';
+import { LanguageSwitcher } from './components/LanguageSwitcher';
+import { responseSchema } from './services/geminiService';
+import { useLocalization } from './hooks/useLocalization';
 import { initialGraphData } from './data/initialGraphData';
-import type { GraphData, Node, Link, SuggestedChanges } from './types';
+import type { GraphData, SwarmResponse, ChatMessage } from './types';
 
 const App: React.FC = () => {
-  const [graphData, setGraphData] = useState<GraphData>(initialGraphData);
+  const { t } = useLocalization();
+
+  const getInitialGraphData = (): GraphData => {
+    const savedGraph = localStorage.getItem('graphData');
+    return savedGraph ? JSON.parse(savedGraph) : initialGraphData;
+  };
+
+  const getInitialChatHistory = (): ChatMessage[] => {
+    const savedChat = localStorage.getItem('chatHistory');
+    return savedChat ? JSON.parse(savedChat) : [];
+  };
+
+  const [graphData, setGraphData] = useState<GraphData>(getInitialGraphData);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(getInitialChatHistory);
   const [isLoading, setIsLoading] = useState(false);
-  const [aiResponse, setAiResponse] = useState<string | null>(null);
-  const [suggestedChanges, setSuggestedChanges] = useState<SuggestedChanges | null>(null);
+  const chatRef = useRef<Chat | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem('graphData', JSON.stringify(graphData));
+  }, [graphData]);
+
+  useEffect(() => {
+    localStorage.setItem('chatHistory', JSON.stringify(chatHistory));
+  }, [chatHistory]);
 
   const handleQuerySubmit = useCallback(async (query: string) => {
     setIsLoading(true);
-    setAiResponse(null);
-    setSuggestedChanges(null);
+    const userMessage: ChatMessage = {
+      id: Date.now().toString(),
+      role: 'user',
+      explanation: query,
+    };
+    setChatHistory(prev => [...prev, userMessage]);
 
     try {
-      const response = await querySwarmConsciousness(query, graphData);
-      setAiResponse(response.explanation);
-      if(response.suggestions) {
-        setSuggestedChanges(response.suggestions);
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const systemInstruction = `You are the LLM_Orchestrator for "Project: The Living Archive". Your purpose is to manage a swarm of specialized AI agents to analyze a user's query against a graph database of creative concepts. Your process for every query is: 1. Decompose the user's query. 2. Delegate tasks to your swarm of Analysts, Explorers, and Dreamers. 3. Receive and weigh their inputs. 4. Synthesize their findings into a single, cohesive, insightful response. 5. Propose potential new nodes (characters, concepts, etc.) and links (relationships) to add to the graph. These are suggestions for a 'Temporal Context Layer'. You MUST return a JSON object that conforms to the provided schema. The 'explanation' should be a rich, narrative-style text embodying the swarm's intelligence. The 'suggestions' field should contain new nodes and links. Ensure suggested node 'id' values are unique, lowercase, and snake_case, and that links only connect existing or newly suggested nodes.`;
+
+      if (!chatRef.current) {
+        chatRef.current = ai.chats.create({
+            model: "gemini-2.5-pro",
+            config: {
+                systemInstruction: systemInstruction,
+                responseMimeType: "application/json",
+                responseSchema: responseSchema,
+                temperature: 0.8,
+            }
+        });
       }
+
+      const prompt = `CURRENT GRAPH DATA: ${JSON.stringify(graphData, null, 2)}\n\nUSER QUERY: "${query}"`;
+      const resultStream = await chatRef.current.sendMessageStream({ message: prompt });
+
+      let aggregatedResponse: SwarmResponse = { explanation: "", suggestions: null };
+      let accumulatedText = "";
+      const modelMessageId = (Date.now() + 1).toString();
+
+      // Add a placeholder for the model's response
+      setChatHistory(prev => [
+        ...prev,
+        { id: modelMessageId, role: 'model', explanation: '...' }
+      ]);
+      
+      for await (const chunk of resultStream) {
+        accumulatedText += chunk.text;
+        try {
+          // Attempt to parse the accumulating text as JSON
+          const parsed = JSON.parse(accumulatedText.trim());
+          aggregatedResponse = parsed;
+          // Update the streaming message in real-time
+          setChatHistory(prev => prev.map(msg => 
+            msg.id === modelMessageId ? { ...msg, explanation: parsed.explanation, suggestions: parsed.suggestions } : msg
+          ));
+        } catch (e) {
+          // JSON is not yet complete, continue accumulating
+        }
+      }
+      
+      // Final update with the complete response
+      setChatHistory(prev => prev.map(msg => 
+        msg.id === modelMessageId ? { ...msg, explanation: aggregatedResponse.explanation, suggestions: aggregatedResponse.suggestions, isMerged: false } : msg
+      ));
+
     } catch (error) {
       console.error("Error querying Swarm Consciousness:", error);
-      setAiResponse(`An error occurred while processing your request. Please check the console for details.`);
+      const errorMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'model',
+        explanation: `An error occurred. Please check the console for details.`
+      };
+      setChatHistory(prev => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
     }
   }, [graphData]);
-  
-  const handleMerge = useCallback(() => {
+
+  const handleMerge = useCallback((messageId: string) => {
+    const message = chatHistory.find(m => m.id === messageId);
+    const suggestedChanges = message?.suggestions;
     if (!suggestedChanges) return;
 
     setGraphData(prevData => {
@@ -64,41 +138,33 @@ const App: React.FC = () => {
       return { nodes: newNodes, links: newLinks };
     });
 
-    setSuggestedChanges(null); // Clear suggestions after merging
-  }, [suggestedChanges]);
-
-  const handleDismiss = useCallback(() => {
-    setAiResponse(null);
-    setSuggestedChanges(null);
-  }, []);
+    setChatHistory(prev => prev.map(msg => msg.id === messageId ? { ...msg, isMerged: true } : msg));
+  }, [chatHistory]);
   
+  const handleClearChat = useCallback(() => {
+    setChatHistory([]);
+    chatRef.current = null; // Reset the chat session
+  }, []);
+
   const memoizedGraph = useMemo(() => <GraphVisualization data={graphData} />, [graphData]);
 
   return (
     <div className="relative w-screen h-screen bg-black overflow-hidden">
       {memoizedGraph}
-      <div className="absolute top-0 left-0 p-4 sm:p-6 z-10">
+      <header className="absolute top-0 left-0 right-0 p-4 sm:p-6 z-10 flex justify-between items-center">
         <h1 className="text-2xl sm:text-4xl font-thin tracking-widest text-cyan-200 uppercase" style={{ textShadow: '0 0 8px #00e5ff' }}>
-          Project: The Living Archive
+          {t('title')}
         </h1>
-      </div>
+        <LanguageSwitcher />
+      </header>
       
-      <div className="absolute bottom-0 left-0 right-0 p-4 z-10 flex flex-col items-center">
-        {(isLoading || aiResponse) && (
-          <div className="w-full max-w-4xl mb-4">
-            {isLoading && <LoadingIndicator />}
-            {aiResponse && (
-              <ResponsePanel
-                response={aiResponse}
-                suggestions={suggestedChanges}
-                onMerge={handleMerge}
-                onDismiss={handleDismiss}
-              />
-            )}
-          </div>
-        )}
-        {!isLoading && <InputBar onSubmit={handleQuerySubmit} />}
-      </div>
+      <ChatPanel
+        messages={chatHistory}
+        isLoading={isLoading}
+        onSubmit={handleQuerySubmit}
+        onMerge={handleMerge}
+        onClear={handleClearChat}
+      />
     </div>
   );
 };
