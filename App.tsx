@@ -75,8 +75,18 @@ const App: React.FC = () => {
       for await (const chunk of resultStream) {
         accumulatedText += chunk.text;
         try {
+          // Clean the text: remove markdown fences and trim
+          let cleanText = accumulatedText.trim();
+          if (cleanText.startsWith("```json")) {
+            cleanText = cleanText.substring(7);
+          }
+          if (cleanText.endsWith("```")) {
+            cleanText = cleanText.substring(0, cleanText.length - 3);
+          }
+          cleanText = cleanText.trim();
+
           // Attempt to parse the accumulating text as JSON
-          const parsed = JSON.parse(accumulatedText.trim());
+          const parsed = JSON.parse(cleanText);
           aggregatedResponse = parsed;
           // Update the streaming message in real-time
           setChatHistory(prev => prev.map(msg => 
